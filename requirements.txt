@@ -1,0 +1,26 @@
+# Website Audit LangGraph Agent - Minimal Requirements
+# Install with: pip install -r requirements.txt
+#
+# Quick Start:
+#   1. pip install -r requirements.txt
+#   2. Set OPENAI_API_KEY in .env file or environment
+#   3. python website_audit_agent.py
+
+# Core LangChain and LangGraph dependencies
+langchain==0.3.3
+langchain-openai==0.2.0
+langchain-community==0.3.2
+langgraph==0.2.18
+
+# Web scraping and HTTP
+aiohttp==3.9.1
+beautifulsoup4==4.12.3
+
+# Configuration and settings
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.0
+
+# Standard library enhancements
+typing-extensions>=4.5.0
+
