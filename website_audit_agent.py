@@ -22,7 +22,7 @@ USAGE:
 
 OUTPUT:
     Results are saved to the 'output' folder:
-    - audit_[domain]_[timestamp].md: Detailed SEO audit report in markdown format with scores and recommendations
+    - audit_[domain]_[timestamp].pdf: Detailed SEO audit report in PDF format with scores and recommendations
 """
 
 import logging
@@ -30,6 +30,8 @@ import json
 import re
 import time
 import os
+import sys
+import asyncio
 from typing import TypedDict, Annotated, List, Optional, Dict, Any, Literal
 from urllib.parse import urlparse
 from pathlib import Path
@@ -43,7 +45,6 @@ from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END, START
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import MemorySaver
 
 # Try to load .env file if python-dotenv is available
 try:
@@ -73,8 +74,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Import PDFGenerator from root folder or current directory
+PDFGenerator = None
+try:
+    # First try root folder (parent of website audit folder)
+    script_dir = Path(__file__).parent.absolute()
+    parent_dir = script_dir.parent
+    if str(parent_dir) not in sys.path:
+        sys.path.insert(0, str(parent_dir))
+    from pdf_generator import PDFGenerator
+
+    logger.info("PDFGenerator imported successfully from root folder")
+except ImportError:
+    # Fallback: try current directory
+    try:
+        from pdf_generator import PDFGenerator
+
+        logger.info("PDFGenerator imported successfully from current directory")
+    except ImportError:
+        PDFGenerator = None
+        logger.warning(
+            "PDFGenerator not found. PDF generation will be disabled. "
+            "Make sure pdf_generator.py is in the root folder or current directory."
+        )
+except Exception as e:
+    PDFGenerator = None
+    logger.warning(
+        f"Error importing PDFGenerator. PDF generation will be disabled. Error: {str(e)}"
+    )
+
 # Get OpenAI API key from environment (will be checked when LLMService is initialized)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Get OpenAI model from environment (defaults to gpt-4o-2024-11-20)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-2024-11-20")
 
 
 # ============================================================================
@@ -90,6 +123,7 @@ class WebsiteAuditState(TypedDict):
     extracted_content: Optional[Dict[str, Any]]
     html_structure: Optional[Dict[str, Any]]
     seo_audit: Optional[Dict[str, Any]]
+    speed_audit: Optional[Dict[str, Any]]
     technical_audit: Optional[Dict[str, Any]]
     content_audit: Optional[Dict[str, Any]]
     recommendations: Optional[List[Dict[str, Any]]]
@@ -271,6 +305,193 @@ async def extract_webpage_content(url: str) -> str:
         return json.dumps({"error": f"Failed to extract content: {str(e)}"})
 
 
+@tool
+async def check_page_speed(url: str) -> str:
+    """
+    Check page load speed and performance metrics for a webpage.
+
+    Args:
+        url: The URL to check speed for
+
+    Returns:
+        JSON string containing speed metrics including load time, response time, and performance analysis
+    """
+    try:
+        logger.info(f"Checking page speed for URL: {url}")
+
+        # Validate URL
+        parsed_url = urlparse(url)
+        if not all([parsed_url.scheme, parsed_url.netloc]):
+            return json.dumps({"error": "Invalid URL format"})
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.81 Safari/537.36"
+        }
+
+        # Measure response time (including content download)
+        start_time = time.time()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=30) as response:
+                # Time to first byte (TTFB)
+                ttfb = time.time() - start_time
+
+                # Get response size and measure total load time
+                content_length = response.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        response_size = int(content_length)
+                        # Still read content to measure actual download time
+                        content = await response.read()
+                        total_time = time.time() - start_time
+                        content = None  # Free memory
+                    except:
+                        response_size = None
+                        content = await response.read()
+                        response_size = len(content)
+                        total_time = time.time() - start_time
+                        content = None  # Free memory
+                else:
+                    # Read content to measure size and total time
+                    content = await response.read()
+                    response_size = len(content)
+                    total_time = time.time() - start_time
+                    content = None  # Free memory
+
+                # Use total_time for scoring (includes full page download)
+                response_time = total_time
+
+                status_code = response.status
+
+                # Check for compression
+                content_encoding = response.headers.get("Content-Encoding", "")
+                is_compressed = content_encoding.lower() in ["gzip", "br", "deflate"]
+
+                # Check cache headers
+                cache_control = response.headers.get("Cache-Control", "")
+                expires = response.headers.get("Expires", "")
+                has_cache = bool(cache_control or expires)
+
+                # Check for CDN
+                server = response.headers.get("Server", "")
+                cdn_headers = ["cloudflare", "cloudfront", "fastly", "akamai", "maxcdn"]
+                uses_cdn = any(cdn in server.lower() for cdn in cdn_headers)
+
+                # Check HTTP version
+                http_version = f"HTTP/{response.version.major}.{response.version.minor}"
+
+                # Calculate performance score (0-100)
+                # Response time scoring with more granular thresholds
+                # <0.5s = 100, <1s = 95, <1.5s = 85, <2s = 75, <3s = 60, <5s = 40, <10s = 20, >=10s = 10
+                if response_time < 0.5:
+                    speed_score = 100
+                elif response_time < 1.0:
+                    speed_score = 95
+                elif response_time < 1.5:
+                    speed_score = 85
+                elif response_time < 2.0:
+                    speed_score = 75
+                elif response_time < 3.0:
+                    speed_score = 60
+                elif response_time < 5.0:
+                    speed_score = 40
+                elif response_time < 10.0:
+                    speed_score = 20
+                else:
+                    speed_score = 10
+
+                # Adjust score based on optimizations (smaller bonuses to avoid inflating scores)
+                optimization_bonus = 0
+                if is_compressed:
+                    optimization_bonus += 3
+                if has_cache:
+                    optimization_bonus += 2
+                if uses_cdn:
+                    optimization_bonus += 2
+
+                speed_score = min(100, speed_score + optimization_bonus)
+
+                # Response size scoring (smaller is better)
+                # More granular size scoring
+                if response_size:
+                    size_mb = response_size / (1024 * 1024)
+                    if size_mb < 0.5:
+                        size_score = 100
+                    elif size_mb < 1.0:
+                        size_score = 95
+                    elif size_mb < 2.0:
+                        size_score = 80
+                    elif size_mb < 3.0:
+                        size_score = 60
+                    elif size_mb < 5.0:
+                        size_score = 40
+                    elif size_mb < 10.0:
+                        size_score = 20
+                    else:
+                        size_score = 10
+                else:
+                    size_score = 50  # Unknown size
+
+                # Overall performance score (weighted average: 75% speed, 25% size)
+                overall_speed_score = int((speed_score * 0.75) + (size_score * 0.25))
+
+                result = {
+                    "url": url,
+                    "response_time_seconds": round(response_time, 3),
+                    "response_time_ms": round(response_time * 1000, 2),
+                    "ttfb_seconds": round(ttfb, 3),
+                    "ttfb_ms": round(ttfb * 1000, 2),
+                    "status_code": status_code,
+                    "response_size_bytes": response_size,
+                    "response_size_mb": (
+                        round(response_size / (1024 * 1024), 2)
+                        if response_size
+                        else None
+                    ),
+                    "is_compressed": is_compressed,
+                    "compression_type": content_encoding if is_compressed else "none",
+                    "has_cache_headers": has_cache,
+                    "cache_control": cache_control if cache_control else None,
+                    "uses_cdn": uses_cdn,
+                    "server": server if server else "unknown",
+                    "http_version": http_version,
+                    "speed_score": speed_score,
+                    "size_score": size_score,
+                    "overall_speed_score": overall_speed_score,
+                    "performance_rating": (
+                        "Excellent"
+                        if overall_speed_score >= 90
+                        else (
+                            "Good"
+                            if overall_speed_score >= 70
+                            else (
+                                "Fair"
+                                if overall_speed_score >= 50
+                                else (
+                                    "Poor" if overall_speed_score >= 30 else "Very Poor"
+                                )
+                            )
+                        )
+                    ),
+                }
+
+                return json.dumps(result, indent=2)
+
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout checking page speed for URL: {url}")
+        return json.dumps(
+            {
+                "error": "Request timeout",
+                "url": url,
+                "response_time_seconds": None,
+                "overall_speed_score": 0,
+                "performance_rating": "Timeout",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error checking page speed: {str(e)}")
+        return json.dumps({"error": f"Failed to check page speed: {str(e)}"})
+
+
 # ============================================================================
 # LLM Service Functions
 # ============================================================================
@@ -279,16 +500,20 @@ async def extract_webpage_content(url: str) -> str:
 class LLMService:
     """Service for interacting with the LLM."""
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or OPENAI_API_KEY
         if not self.api_key:
             raise ValueError(
                 "OpenAI API key is not set. Please set OPENAI_API_KEY environment variable or pass it as a parameter."
             )
 
+        # Use provided model, environment variable, or default
+        self.model = model or OPENAI_MODEL
+        logger.info(f"Using OpenAI model: {self.model}")
+
         self.llm = ChatOpenAI(
-            model="gpt-4o-2024-11-20",
-            temperature=0.3,
+            model=self.model,
+            temperature=1,
             streaming=False,
             verbose=False,
             api_key=self.api_key,
@@ -617,6 +842,55 @@ async def analyze_seo_node(state: WebsiteAuditState) -> WebsiteAuditState:
         return {**state, "status": "error", "error": str(e)}
 
 
+async def check_speed_node(state: WebsiteAuditState) -> WebsiteAuditState:
+    """Check page load speed and performance metrics."""
+    try:
+        print("\n" + "=" * 80)
+        print("⚡ NODE: check_speed_node - Checking page speed")
+        print("=" * 80)
+        logger.info("Checking page speed")
+
+        url = state.get("url", "")
+        if not url:
+            return {
+                **state,
+                "status": "error",
+                "error": "No URL provided for speed check",
+            }
+
+        speed_json = await check_page_speed.ainvoke(url)
+        speed_data = json.loads(speed_json)
+
+        if "error" in speed_data:
+            print(
+                f"⚠️  Warning: Speed check encountered an issue: {speed_data['error']}"
+            )
+            # Don't fail the workflow, just log the warning
+            speed_data["overall_speed_score"] = 0
+            speed_data["performance_rating"] = "Error"
+
+        response_time = speed_data.get("response_time_seconds", 0)
+        speed_score = speed_data.get("overall_speed_score", 0)
+        print(
+            f"✅ Speed check completed (Response time: {response_time:.3f}s, Score: {speed_score}/100)"
+        )
+
+        return {
+            **state,
+            "speed_audit": speed_data,
+            "status": "speed_checked",
+        }
+    except Exception as e:
+        print(f"❌ Error in check_speed_node: {str(e)}")
+        logger.error(f"Error in check_speed_node: {str(e)}")
+        # Don't fail the workflow, just log the error
+        return {
+            **state,
+            "speed_audit": {"error": str(e), "overall_speed_score": 0},
+            "status": "speed_checked",
+        }
+
+
 async def generate_recommendations_node(state: WebsiteAuditState) -> WebsiteAuditState:
     """Generate actionable recommendations."""
     try:
@@ -657,10 +931,14 @@ async def agent_node(state: WebsiteAuditState) -> WebsiteAuditState:
             return await extract_content_node(state)
 
         elif current_status == "content_extracted":
-            # Move to SEO analysis
+            # Move to SEO analysis (can run in parallel with speed check, but we'll do SEO first)
             return await analyze_seo_node(state)
 
         elif current_status == "seo_analyzed":
+            # Check page speed after SEO analysis
+            return await check_speed_node(state)
+
+        elif current_status == "speed_checked":
             # Move to recommendations
             return await generate_recommendations_node(state)
 
@@ -714,9 +992,8 @@ def create_website_audit_agent():
         },
     )
 
-    # Compile the graph with memory
-    memory = MemorySaver()
-    graph = workflow.compile(checkpointer=memory)
+    # Compile the graph (no memory/checkpointer needed for one-time analysis)
+    graph = workflow.compile()
 
     return graph
 
@@ -736,14 +1013,12 @@ class WebsiteAuditAgent:
     async def process(
         self,
         url: str,
-        thread_id: str = "default",
     ) -> Dict[str, Any]:
         """
         Process a website SEO audit request.
 
         Args:
             url: URL to audit
-            thread_id: Thread ID for conversation tracking (default: default)
 
         Returns:
             Dictionary containing the audit results and recommendations
@@ -765,6 +1040,7 @@ class WebsiteAuditAgent:
                 "extracted_content": None,
                 "html_structure": None,
                 "seo_audit": None,
+                "speed_audit": None,
                 "technical_audit": None,
                 "content_audit": None,
                 "recommendations": None,
@@ -777,10 +1053,9 @@ class WebsiteAuditAgent:
             print("\n" + "=" * 80)
             print("🚀 Starting Website Audit Agent Workflow")
             print("=" * 80)
-            config = {"configurable": {"thread_id": thread_id}}
             result = None
 
-            async for event in self.graph.astream(initial_state, config):
+            async for event in self.graph.astream(initial_state):
                 result = event
                 # Log progress
                 if "agent" in event:
@@ -807,6 +1082,7 @@ class WebsiteAuditAgent:
                 "url": url,
                 "extracted_content": final_state.get("extracted_content", {}),
                 "seo_audit": final_state.get("seo_audit", {}),
+                "speed_audit": final_state.get("speed_audit", {}),
                 "recommendations": final_state.get("recommendations", {}),
                 "overall_score": final_state.get("overall_score", 0),
                 "processing_status": final_state.get("status", "unknown"),
@@ -868,6 +1144,393 @@ def sanitize_filename(url: str, max_length: int = 100) -> str:
 
 
 # ============================================================================
+# Report Generation Functions
+# ============================================================================
+
+
+def generate_audit_report_markdown(
+    url: str,
+    extracted_content: Dict[str, Any],
+    seo_audit: Dict[str, Any],
+    recommendations: Dict[str, Any],
+    overall_score: int,
+    speed_audit: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Generate markdown content for the audit report."""
+    markdown_content = []
+
+    markdown_content.append(f"**URL:** {url}\n\n")
+    markdown_content.append(f"**Overall SEO Score:** {overall_score}/100\n\n")
+
+    # Add speed score if available
+    if speed_audit and not speed_audit.get("error"):
+        speed_score = speed_audit.get("overall_speed_score", 0)
+        markdown_content.append(f"**Page Speed Score:** {speed_score}/100\n\n")
+
+    if extracted_content:
+        markdown_content.append("## Page Information\n\n")
+        markdown_content.append(
+            f"- **Title:** {extracted_content.get('title', 'N/A')}\n"
+        )
+        markdown_content.append(
+            f"- **Title Length:** {extracted_content.get('title_length', 0)} characters\n"
+        )
+        markdown_content.append(
+            f"- **Meta Description:** {extracted_content.get('meta_description', 'N/A')}\n"
+        )
+        markdown_content.append(
+            f"- **Meta Description Length:** {extracted_content.get('meta_description_length', 0)} characters\n"
+        )
+        markdown_content.append(
+            f"- **Word Count:** {extracted_content.get('word_count', 0)}\n"
+        )
+        markdown_content.append(
+            f"- **H1 Count:** {extracted_content.get('h1_count', 0)}\n"
+        )
+        if extracted_content.get("headings", {}).get("h1"):
+            markdown_content.append(
+                f"- **H1 Tags:** {', '.join(extracted_content['headings']['h1'])}\n"
+            )
+        markdown_content.append(f"\n### Images\n\n")
+        markdown_content.append(
+            f"- **Total:** {extracted_content.get('images', {}).get('total', 0)}\n"
+        )
+        markdown_content.append(
+            f"- **With alt text:** {extracted_content.get('images', {}).get('with_alt', 0)}\n"
+        )
+        markdown_content.append(
+            f"- **Without alt text:** {extracted_content.get('images', {}).get('without_alt', 0)}\n"
+        )
+        markdown_content.append(f"\n### Links\n\n")
+        markdown_content.append(
+            f"- **Total:** {extracted_content.get('links', {}).get('total', 0)}\n"
+        )
+        markdown_content.append(
+            f"- **Internal:** {extracted_content.get('links', {}).get('internal', 0)}\n"
+        )
+        markdown_content.append(
+            f"- **External:** {extracted_content.get('links', {}).get('external', 0)}\n\n"
+        )
+
+    if seo_audit:
+        markdown_content.append("## SEO Audit Results\n\n")
+
+        # Title Analysis
+        if seo_audit.get("title_analysis"):
+            markdown_content.append("### Title Analysis\n\n")
+            title_analysis = seo_audit["title_analysis"]
+            markdown_content.append(
+                f"**Score:** {title_analysis.get('score', 0)}/100\n\n"
+            )
+            if title_analysis.get("issues"):
+                markdown_content.append("#### Issues\n\n")
+                for issue in title_analysis["issues"]:
+                    markdown_content.append(
+                        f'- <span class="issue-item">{issue}</span>\n'
+                    )
+                markdown_content.append("\n")
+            if title_analysis.get("suggestions"):
+                markdown_content.append("#### Suggestions\n\n")
+                for suggestion in title_analysis["suggestions"]:
+                    markdown_content.append(
+                        f'- <span class="suggestion-item">{suggestion}</span>\n'
+                    )
+                markdown_content.append("\n")
+
+        # Meta Description Analysis
+        if seo_audit.get("meta_description_analysis"):
+            markdown_content.append("### Meta Description Analysis\n\n")
+            meta_analysis = seo_audit["meta_description_analysis"]
+            markdown_content.append(
+                f"**Score:** {meta_analysis.get('score', 0)}/100\n\n"
+            )
+            if meta_analysis.get("issues"):
+                markdown_content.append("#### Issues\n\n")
+                for issue in meta_analysis["issues"]:
+                    markdown_content.append(
+                        f'- <span class="issue-item">{issue}</span>\n'
+                    )
+                markdown_content.append("\n")
+            if meta_analysis.get("suggestions"):
+                markdown_content.append("#### Suggestions\n\n")
+                for suggestion in meta_analysis["suggestions"]:
+                    markdown_content.append(
+                        f'- <span class="suggestion-item">{suggestion}</span>\n'
+                    )
+                markdown_content.append("\n")
+
+        # Heading Structure
+        if seo_audit.get("heading_structure"):
+            markdown_content.append("### Heading Structure\n\n")
+            heading = seo_audit["heading_structure"]
+            markdown_content.append(f"**Score:** {heading.get('score', 0)}/100\n\n")
+            if heading.get("issues"):
+                markdown_content.append("#### Issues\n\n")
+                for issue in heading["issues"]:
+                    markdown_content.append(
+                        f'- <span class="issue-item">{issue}</span>\n'
+                    )
+                markdown_content.append("\n")
+            if heading.get("suggestions"):
+                markdown_content.append("#### Suggestions\n\n")
+                for suggestion in heading["suggestions"]:
+                    markdown_content.append(
+                        f'- <span class="suggestion-item">{suggestion}</span>\n'
+                    )
+                markdown_content.append("\n")
+
+        # Content Analysis
+        if seo_audit.get("content_analysis"):
+            markdown_content.append("### Content Analysis\n\n")
+            content = seo_audit["content_analysis"]
+            markdown_content.append(f"**Score:** {content.get('score', 0)}/100\n\n")
+            if content.get("issues"):
+                markdown_content.append("#### Issues\n\n")
+                for issue in content["issues"]:
+                    markdown_content.append(
+                        f'- <span class="issue-item">{issue}</span>\n'
+                    )
+                markdown_content.append("\n")
+            if content.get("suggestions"):
+                markdown_content.append("#### Suggestions\n\n")
+                for suggestion in content["suggestions"]:
+                    markdown_content.append(
+                        f'- <span class="suggestion-item">{suggestion}</span>\n'
+                    )
+                markdown_content.append("\n")
+
+        # Image Optimization
+        if seo_audit.get("image_optimization"):
+            markdown_content.append("### Image Optimization\n\n")
+            images = seo_audit["image_optimization"]
+            markdown_content.append(f"**Score:** {images.get('score', 0)}/100\n\n")
+            if images.get("issues"):
+                markdown_content.append("#### Issues\n\n")
+                for issue in images["issues"]:
+                    markdown_content.append(
+                        f'- <span class="issue-item">{issue}</span>\n'
+                    )
+                markdown_content.append("\n")
+            if images.get("suggestions"):
+                markdown_content.append("#### Suggestions\n\n")
+                for suggestion in images["suggestions"]:
+                    markdown_content.append(
+                        f'- <span class="suggestion-item">{suggestion}</span>\n'
+                    )
+                markdown_content.append("\n")
+
+        # Technical SEO
+        if seo_audit.get("technical_seo"):
+            markdown_content.append("### Technical SEO\n\n")
+            technical = seo_audit["technical_seo"]
+            markdown_content.append(f"**Score:** {technical.get('score', 0)}/100\n\n")
+            if technical.get("issues"):
+                markdown_content.append("#### Issues\n\n")
+                for issue in technical["issues"]:
+                    markdown_content.append(
+                        f'- <span class="issue-item">{issue}</span>\n'
+                    )
+                markdown_content.append("\n")
+            if technical.get("suggestions"):
+                markdown_content.append("#### Suggestions\n\n")
+                for suggestion in technical["suggestions"]:
+                    markdown_content.append(
+                        f'- <span class="suggestion-item">{suggestion}</span>\n'
+                    )
+                markdown_content.append("\n")
+
+    # Speed Audit Section
+    if speed_audit and not speed_audit.get("error"):
+        markdown_content.append("## Page Speed Analysis\n\n")
+        markdown_content.append(
+            f"**Overall Speed Score:** {speed_audit.get('overall_speed_score', 0)}/100\n\n"
+        )
+        markdown_content.append(
+            f"**Performance Rating:** {speed_audit.get('performance_rating', 'N/A')}\n\n"
+        )
+
+        markdown_content.append("### Speed Metrics\n\n")
+        markdown_content.append(
+            f"- **Response Time:** {speed_audit.get('response_time_seconds', 0):.3f} seconds ({speed_audit.get('response_time_ms', 0):.2f} ms)\n"
+        )
+        if speed_audit.get("response_size_bytes"):
+            markdown_content.append(
+                f"- **Page Size:** {speed_audit.get('response_size_mb', 0):.2f} MB ({speed_audit.get('response_size_bytes', 0):,} bytes)\n"
+            )
+        markdown_content.append(
+            f"- **HTTP Version:** {speed_audit.get('http_version', 'N/A')}\n"
+        )
+        markdown_content.append(
+            f"- **Status Code:** {speed_audit.get('status_code', 'N/A')}\n\n"
+        )
+
+        markdown_content.append("### Performance Optimizations\n\n")
+        markdown_content.append(
+            f"- **Compression:** {'✅ Enabled' if speed_audit.get('is_compressed') else '❌ Not enabled'}"
+        )
+        if speed_audit.get("is_compressed"):
+            markdown_content.append(
+                f" ({speed_audit.get('compression_type', 'unknown')})"
+            )
+        markdown_content.append("\n")
+        markdown_content.append(
+            f"- **Cache Headers:** {'✅ Present' if speed_audit.get('has_cache_headers') else '❌ Missing'}\n"
+        )
+        markdown_content.append(
+            f"- **CDN:** {'✅ Detected' if speed_audit.get('uses_cdn') else '❌ Not detected'}"
+        )
+        if speed_audit.get("uses_cdn") and speed_audit.get("server"):
+            markdown_content.append(f" ({speed_audit.get('server', '')})")
+        markdown_content.append("\n\n")
+
+        # Speed recommendations
+        speed_issues = []
+        speed_suggestions = []
+
+        if speed_audit.get("response_time_seconds", 0) > 3.0:
+            speed_issues.append(
+                f"Slow response time ({speed_audit.get('response_time_seconds', 0):.3f}s) - should be under 2 seconds"
+            )
+            speed_suggestions.append(
+                "Optimize server response time, use CDN, enable caching"
+            )
+
+        if not speed_audit.get("is_compressed"):
+            speed_issues.append("Content compression not enabled")
+            speed_suggestions.append(
+                "Enable GZIP or Brotli compression to reduce page size"
+            )
+
+        if not speed_audit.get("has_cache_headers"):
+            speed_issues.append("Cache headers missing")
+            speed_suggestions.append(
+                "Add Cache-Control and Expires headers for static resources"
+            )
+
+        if (
+            speed_audit.get("response_size_mb", 0)
+            and speed_audit.get("response_size_mb", 0) > 3.0
+        ):
+            speed_issues.append(
+                f"Large page size ({speed_audit.get('response_size_mb', 0):.2f} MB) - should be under 2 MB"
+            )
+            speed_suggestions.append(
+                "Optimize images, minify CSS/JS, remove unused resources"
+            )
+
+        if speed_issues:
+            markdown_content.append("#### Speed Issues\n\n")
+            for issue in speed_issues:
+                markdown_content.append(f'- <span class="issue-item">{issue}</span>\n')
+            markdown_content.append("\n")
+
+        if speed_suggestions:
+            markdown_content.append("#### Speed Optimization Suggestions\n\n")
+            for suggestion in speed_suggestions:
+                markdown_content.append(
+                    f'- <span class="suggestion-item">{suggestion}</span>\n'
+                )
+            markdown_content.append("\n")
+
+    if seo_audit:
+        # Priority Fixes
+        if seo_audit.get("priority_fixes"):
+            markdown_content.append("### Priority Fixes\n\n")
+            for i, fix in enumerate(seo_audit["priority_fixes"], 1):
+                markdown_content.append(f"#### {i}. {fix.get('issue', 'N/A')}\n\n")
+                markdown_content.append(
+                    f"- **Priority:** {fix.get('priority', 'medium').upper()}\n"
+                )
+                markdown_content.append(f"- **Impact:** {fix.get('impact', 'N/A')}\n")
+                markdown_content.append(
+                    f"- **Solution:** {fix.get('solution', 'N/A')}\n\n"
+                )
+
+        # Strengths
+        if seo_audit.get("strengths"):
+            markdown_content.append("### Strengths\n\n")
+            for strength in seo_audit["strengths"]:
+                markdown_content.append(
+                    f'- <span class="strength-item">{strength}</span>\n'
+                )
+            markdown_content.append("\n")
+
+        # Quick Wins
+        if seo_audit.get("quick_wins"):
+            markdown_content.append("### Quick Wins\n\n")
+            for win in seo_audit["quick_wins"]:
+                markdown_content.append(
+                    f'- <span class="quick-win-item">{win}</span>\n'
+                )
+            markdown_content.append("\n")
+
+    if recommendations:
+        markdown_content.append("## Action Plan\n\n")
+
+        # Immediate Actions
+        if recommendations.get("immediate_actions"):
+            markdown_content.append("### Immediate Actions (Do First)\n\n")
+            for i, action in enumerate(recommendations["immediate_actions"], 1):
+                markdown_content.append(f"#### {i}. {action.get('action', 'N/A')}\n\n")
+                markdown_content.append(
+                    f"- **Expected Impact:** {action.get('expected_impact', 'N/A').upper()}\n"
+                )
+                markdown_content.append(
+                    f"- **Implementation Time:** {action.get('implementation_time', 'N/A')}\n"
+                )
+                if action.get("steps"):
+                    markdown_content.append(f"\n**Steps:**\n\n")
+                    for step in action["steps"]:
+                        markdown_content.append(f"1. {step}\n")
+                markdown_content.append("\n")
+
+        # Short-term Improvements
+        if recommendations.get("short_term_improvements"):
+            markdown_content.append("### Short-term Improvements (1-4 Weeks)\n\n")
+            for i, action in enumerate(recommendations["short_term_improvements"], 1):
+                markdown_content.append(f"#### {i}. {action.get('action', 'N/A')}\n\n")
+                markdown_content.append(
+                    f"- **Expected Impact:** {action.get('expected_impact', 'N/A').upper()}\n"
+                )
+                markdown_content.append(
+                    f"- **Implementation Time:** {action.get('implementation_time', 'N/A')}\n"
+                )
+                if action.get("steps"):
+                    markdown_content.append(f"\n**Steps:**\n\n")
+                    for step in action["steps"]:
+                        markdown_content.append(f"1. {step}\n")
+                markdown_content.append("\n")
+
+        # Long-term Strategy
+        if recommendations.get("long_term_strategy"):
+            markdown_content.append("### Long-term Strategy (1-6 Months)\n\n")
+            for i, action in enumerate(recommendations["long_term_strategy"], 1):
+                markdown_content.append(f"#### {i}. {action.get('action', 'N/A')}\n\n")
+                markdown_content.append(
+                    f"- **Expected Impact:** {action.get('expected_impact', 'N/A').upper()}\n"
+                )
+                markdown_content.append(
+                    f"- **Implementation Time:** {action.get('implementation_time', 'N/A')}\n"
+                )
+                if action.get("steps"):
+                    markdown_content.append(f"\n**Steps:**\n\n")
+                    for step in action["steps"]:
+                        markdown_content.append(f"1. {step}\n")
+                markdown_content.append("\n")
+
+        # Summary
+        markdown_content.append("### Summary\n\n")
+        markdown_content.append(
+            f"- **Estimated Overall Improvement:** {recommendations.get('estimated_overall_improvement', 'N/A')}\n"
+        )
+        markdown_content.append(
+            f"- **Timeline:** {recommendations.get('timeline', 'N/A')}\n\n"
+        )
+
+    return "".join(markdown_content)
+
+
+# ============================================================================
 # Example Usage
 # ============================================================================
 
@@ -899,6 +1562,7 @@ async def example_usage():
     # Get data
     extracted_content = result.get("extracted_content", {})
     seo_audit = result.get("seo_audit", {})
+    speed_audit = result.get("speed_audit", {})
     recommendations = result.get("recommendations", {})
     overall_score = result.get("overall_score", 0)
 
@@ -906,256 +1570,83 @@ async def example_usage():
     sanitized_url = sanitize_filename(url)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Save audit report as markdown
-    report_file = output_dir / f"audit_{sanitized_url}_{timestamp}.md"
-    with open(report_file, "w", encoding="utf-8") as f:
-        f.write("# Website SEO Audit Report\n\n")
-        f.write(f"**Generated at:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write(f"**URL:** {url}\n\n")
-        f.write(f"**Overall SEO Score:** {overall_score}/100\n\n")
-        f.write("---\n\n")
+    # Generate markdown content for PDF
+    report_markdown = generate_audit_report_markdown(
+        url=url,
+        extracted_content=extracted_content,
+        seo_audit=seo_audit,
+        recommendations=recommendations,
+        overall_score=overall_score,
+        speed_audit=speed_audit,
+    )
 
-        if extracted_content:
-            f.write("## Page Information\n\n")
-            f.write(f"- **Title:** {extracted_content.get('title', 'N/A')}\n")
+    # Generate PDF using PDFGenerator
+    if PDFGenerator is None:
+        # Fallback to markdown if PDFGenerator is not available
+        report_file = output_dir / f"audit_{sanitized_url}_{timestamp}.md"
+        with open(report_file, "w", encoding="utf-8") as f:
+            f.write("# Website SEO Audit Report\n\n")
             f.write(
-                f"- **Title Length:** {extracted_content.get('title_length', 0)} characters\n"
+                f"**Generated at:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
             )
-            f.write(
-                f"- **Meta Description:** {extracted_content.get('meta_description', 'N/A')}\n"
+            f.write(report_markdown)
+        print(f"\n✅ Audit report saved to: {report_file}")
+        print(f"   Full path: {report_file.absolute()}")
+        print("   Note: PDF generation is not available. Saved as markdown instead.")
+    else:
+        try:
+            # Prepare article data for PDFGenerator
+            page_title = (
+                extracted_content.get("title", "Website SEO Audit Report")
+                if extracted_content
+                else "Website SEO Audit Report"
             )
-            f.write(
-                f"- **Meta Description Length:** {extracted_content.get('meta_description_length', 0)} characters\n"
+            meta_description = (
+                extracted_content.get("meta_description", f"SEO audit report for {url}")
+                if extracted_content
+                else f"SEO audit report for {url}"
             )
-            f.write(f"- **Word Count:** {extracted_content.get('word_count', 0)}\n")
-            f.write(f"- **H1 Count:** {extracted_content.get('h1_count', 0)}\n")
-            if extracted_content.get("headings", {}).get("h1"):
+
+            article_data = {
+                "title": f"Website SEO Audit Report - {page_title}",
+                "description": meta_description,
+                "content": report_markdown,
+                "keywords": [],
+                "meta_info": {"thumbnail_url": "", "faqs": []},
+                "created_at": datetime.now().isoformat(),
+                "word_count": (
+                    extracted_content.get("word_count", 0) if extracted_content else 0
+                ),
+                "readability_level": "General",
+                "target_audience": "General",
+                "article_tone": "Professional",
+            }
+
+            # Generate PDF
+            pdf_generator = PDFGenerator()
+            pdf_bytes = pdf_generator.generate_article_pdf(article_data)
+
+            # Save PDF file
+            report_file = output_dir / f"audit_{sanitized_url}_{timestamp}.pdf"
+            with open(report_file, "wb") as f:
+                f.write(pdf_bytes)
+
+            print(f"\n✅ Audit report saved to: {report_file}")
+            print(f"   Full path: {report_file.absolute()}")
+        except Exception as e:
+            logger.error(f"Error generating PDF: {str(e)}")
+            # Fallback to markdown on error
+            report_file = output_dir / f"audit_{sanitized_url}_{timestamp}.md"
+            with open(report_file, "w", encoding="utf-8") as f:
+                f.write("# Website SEO Audit Report\n\n")
                 f.write(
-                    f"- **H1 Tags:** {', '.join(extracted_content['headings']['h1'])}\n"
+                    f"**Generated at:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 )
-            f.write(f"\n### Images\n\n")
-            f.write(
-                f"- **Total:** {extracted_content.get('images', {}).get('total', 0)}\n"
+                f.write(report_markdown)
+            print(
+                f"\n⚠️  PDF generation failed. Audit report saved as markdown: {report_file}"
             )
-            f.write(
-                f"- **With alt text:** {extracted_content.get('images', {}).get('with_alt', 0)}\n"
-            )
-            f.write(
-                f"- **Without alt text:** {extracted_content.get('images', {}).get('without_alt', 0)}\n"
-            )
-            f.write(f"\n### Links\n\n")
-            f.write(
-                f"- **Total:** {extracted_content.get('links', {}).get('total', 0)}\n"
-            )
-            f.write(
-                f"- **Internal:** {extracted_content.get('links', {}).get('internal', 0)}\n"
-            )
-            f.write(
-                f"- **External:** {extracted_content.get('links', {}).get('external', 0)}\n\n"
-            )
-            f.write("---\n\n")
-
-        if seo_audit:
-            f.write("## SEO Audit Results\n\n")
-
-            # Title Analysis
-            if seo_audit.get("title_analysis"):
-                f.write("### Title Analysis\n\n")
-                title_analysis = seo_audit["title_analysis"]
-                f.write(f"**Score:** {title_analysis.get('score', 0)}/100\n\n")
-                if title_analysis.get("issues"):
-                    f.write("#### Issues\n\n")
-                    for issue in title_analysis["issues"]:
-                        f.write(f"- ❌ {issue}\n")
-                    f.write("\n")
-                if title_analysis.get("suggestions"):
-                    f.write("#### Suggestions\n\n")
-                    for suggestion in title_analysis["suggestions"]:
-                        f.write(f"- 💡 {suggestion}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Meta Description Analysis
-            if seo_audit.get("meta_description_analysis"):
-                f.write("### Meta Description Analysis\n\n")
-                meta_analysis = seo_audit["meta_description_analysis"]
-                f.write(f"**Score:** {meta_analysis.get('score', 0)}/100\n\n")
-                if meta_analysis.get("issues"):
-                    f.write("#### Issues\n\n")
-                    for issue in meta_analysis["issues"]:
-                        f.write(f"- ❌ {issue}\n")
-                    f.write("\n")
-                if meta_analysis.get("suggestions"):
-                    f.write("#### Suggestions\n\n")
-                    for suggestion in meta_analysis["suggestions"]:
-                        f.write(f"- 💡 {suggestion}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Heading Structure
-            if seo_audit.get("heading_structure"):
-                f.write("### Heading Structure\n\n")
-                heading = seo_audit["heading_structure"]
-                f.write(f"**Score:** {heading.get('score', 0)}/100\n\n")
-                if heading.get("issues"):
-                    f.write("#### Issues\n\n")
-                    for issue in heading["issues"]:
-                        f.write(f"- ❌ {issue}\n")
-                    f.write("\n")
-                if heading.get("suggestions"):
-                    f.write("#### Suggestions\n\n")
-                    for suggestion in heading["suggestions"]:
-                        f.write(f"- 💡 {suggestion}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Content Analysis
-            if seo_audit.get("content_analysis"):
-                f.write("### Content Analysis\n\n")
-                content = seo_audit["content_analysis"]
-                f.write(f"**Score:** {content.get('score', 0)}/100\n\n")
-                if content.get("issues"):
-                    f.write("#### Issues\n\n")
-                    for issue in content["issues"]:
-                        f.write(f"- ❌ {issue}\n")
-                    f.write("\n")
-                if content.get("suggestions"):
-                    f.write("#### Suggestions\n\n")
-                    for suggestion in content["suggestions"]:
-                        f.write(f"- 💡 {suggestion}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Image Optimization
-            if seo_audit.get("image_optimization"):
-                f.write("### Image Optimization\n\n")
-                images = seo_audit["image_optimization"]
-                f.write(f"**Score:** {images.get('score', 0)}/100\n\n")
-                if images.get("issues"):
-                    f.write("#### Issues\n\n")
-                    for issue in images["issues"]:
-                        f.write(f"- ❌ {issue}\n")
-                    f.write("\n")
-                if images.get("suggestions"):
-                    f.write("#### Suggestions\n\n")
-                    for suggestion in images["suggestions"]:
-                        f.write(f"- 💡 {suggestion}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Technical SEO
-            if seo_audit.get("technical_seo"):
-                f.write("### Technical SEO\n\n")
-                technical = seo_audit["technical_seo"]
-                f.write(f"**Score:** {technical.get('score', 0)}/100\n\n")
-                if technical.get("issues"):
-                    f.write("#### Issues\n\n")
-                    for issue in technical["issues"]:
-                        f.write(f"- ❌ {issue}\n")
-                    f.write("\n")
-                if technical.get("suggestions"):
-                    f.write("#### Suggestions\n\n")
-                    for suggestion in technical["suggestions"]:
-                        f.write(f"- 💡 {suggestion}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Priority Fixes
-            if seo_audit.get("priority_fixes"):
-                f.write("### Priority Fixes\n\n")
-                for i, fix in enumerate(seo_audit["priority_fixes"], 1):
-                    f.write(f"#### {i}. {fix.get('issue', 'N/A')}\n\n")
-                    f.write(
-                        f"- **Priority:** {fix.get('priority', 'medium').upper()}\n"
-                    )
-                    f.write(f"- **Impact:** {fix.get('impact', 'N/A')}\n")
-                    f.write(f"- **Solution:** {fix.get('solution', 'N/A')}\n\n")
-                f.write("---\n\n")
-
-            # Strengths
-            if seo_audit.get("strengths"):
-                f.write("### Strengths\n\n")
-                for strength in seo_audit["strengths"]:
-                    f.write(f"- ✅ {strength}\n")
-                f.write("\n")
-                f.write("---\n\n")
-
-            # Quick Wins
-            if seo_audit.get("quick_wins"):
-                f.write("### Quick Wins\n\n")
-                for win in seo_audit["quick_wins"]:
-                    f.write(f"- ⚡ {win}\n")
-                f.write("\n")
-                f.write("---\n\n")
-
-        if recommendations:
-            f.write("## Action Plan\n\n")
-
-            # Immediate Actions
-            if recommendations.get("immediate_actions"):
-                f.write("### Immediate Actions (Do First)\n\n")
-                for i, action in enumerate(recommendations["immediate_actions"], 1):
-                    f.write(f"#### {i}. {action.get('action', 'N/A')}\n\n")
-                    f.write(
-                        f"- **Expected Impact:** {action.get('expected_impact', 'N/A').upper()}\n"
-                    )
-                    f.write(
-                        f"- **Implementation Time:** {action.get('implementation_time', 'N/A')}\n"
-                    )
-                    if action.get("steps"):
-                        f.write(f"\n**Steps:**\n\n")
-                        for step in action["steps"]:
-                            f.write(f"1. {step}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Short-term Improvements
-            if recommendations.get("short_term_improvements"):
-                f.write("### Short-term Improvements (1-4 Weeks)\n\n")
-                for i, action in enumerate(
-                    recommendations["short_term_improvements"], 1
-                ):
-                    f.write(f"#### {i}. {action.get('action', 'N/A')}\n\n")
-                    f.write(
-                        f"- **Expected Impact:** {action.get('expected_impact', 'N/A').upper()}\n"
-                    )
-                    f.write(
-                        f"- **Implementation Time:** {action.get('implementation_time', 'N/A')}\n"
-                    )
-                    if action.get("steps"):
-                        f.write(f"\n**Steps:**\n\n")
-                        for step in action["steps"]:
-                            f.write(f"1. {step}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Long-term Strategy
-            if recommendations.get("long_term_strategy"):
-                f.write("### Long-term Strategy (1-6 Months)\n\n")
-                for i, action in enumerate(recommendations["long_term_strategy"], 1):
-                    f.write(f"#### {i}. {action.get('action', 'N/A')}\n\n")
-                    f.write(
-                        f"- **Expected Impact:** {action.get('expected_impact', 'N/A').upper()}\n"
-                    )
-                    f.write(
-                        f"- **Implementation Time:** {action.get('implementation_time', 'N/A')}\n"
-                    )
-                    if action.get("steps"):
-                        f.write(f"\n**Steps:**\n\n")
-                        for step in action["steps"]:
-                            f.write(f"1. {step}\n")
-                    f.write("\n")
-                f.write("---\n\n")
-
-            # Summary
-            f.write("### Summary\n\n")
-            f.write(
-                f"- **Estimated Overall Improvement:** {recommendations.get('estimated_overall_improvement', 'N/A')}\n"
-            )
-            f.write(f"- **Timeline:** {recommendations.get('timeline', 'N/A')}\n\n")
-
-    print(f"\n✅ Audit report saved to: {report_file}")
-    print(f"   Full path: {report_file.absolute()}")
+            print(f"   Error: {str(e)}")
 
 
 if __name__ == "__main__":
