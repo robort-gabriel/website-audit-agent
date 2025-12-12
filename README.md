@@ -112,13 +112,6 @@ export OPENAI_MODEL=gpt-4o-mini
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-**Supported Models:**
-- `gpt-4o-2024-11-20` (default) - Latest GPT-4o model with best performance
-- `gpt-4o` - GPT-4o model
-- `gpt-4o-mini` - Faster and cheaper GPT-4o variant
-- `gpt-4-turbo` - GPT-4 Turbo model
-- `gpt-3.5-turbo` - GPT-3.5 Turbo (faster, less accurate)
-
 **Note:** If not set, the AI agent defaults to `gpt-4o-2024-11-20` for optimal results.
 
 ### Optional: LangSmith for LLM Logging and Observability
